@@ -44,7 +44,7 @@ When calling ```.EnableCache()``` you can provide some options, but it is up to 
 
 ## How Does The Lib Work
 The lib replaces the ```DefaultHealthCheckService``` provided by Microsoft and inject its own, called ```CacheableHealthCheckService```.
-This new service was largely based on the default implementation, so you can expect the exact same behavior, with one exception, you can now cache responses.
+This new service was largely based on the default implementation (2.2), so you can expect the exact same behavior, with one exception, you can now cache responses.
 
 When you call ```.EnableCache()``` after a registration, the lib adds a tag `cacheable` to the list of tags for it. You can change this tag using the options if you think you may collide with this one.
 
