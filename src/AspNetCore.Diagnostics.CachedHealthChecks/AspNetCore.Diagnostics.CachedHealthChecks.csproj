@@ -1,0 +1,28 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>netcoreapp2.2;netcoreapp3.1</TargetFrameworks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <Authors>Cleverson Albino do Nascimento</Authors>
+    <Company>SuriTI</Company>
+    <Description>This lib is an extension built on top of the Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckService that allows the developer to choose to cache any checks they want.</Description>
+    <Copyright />
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/SuricateCan/AspNetCore.Diagnostics.CachedHealthChecks</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/SuricateCan/AspNetCore.Diagnostics.CachedHealthChecks</RepositoryUrl>
+    <PackageTags>healthcheck cache</PackageTags>
+    <NeutralLanguage>en</NeutralLanguage>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'netcoreapp3.1'">
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="3.1" />
+    <PackageReference Include="Microsoft.Extensions.Caching.Abstractions" Version="3.1" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'netcoreapp2.2'">
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="2.2" />
+    <PackageReference Include="Microsoft.Extensions.Caching.Abstractions" Version="2.2" />
+  </ItemGroup>
+</Project>
