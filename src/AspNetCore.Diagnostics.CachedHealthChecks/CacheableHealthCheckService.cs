@@ -38,6 +38,8 @@ namespace AspNetCore.Diagnostics.CachedHealthChecks
             ValidateRegistrations(baseOptions.Value.Registrations.ToArray());
         }
 
+#if NETCOREAPP2_2
+
         public override async Task<HealthReport> CheckHealthAsync(Func<HealthCheckRegistration, bool> predicate, CancellationToken cancellationToken = default)
         {
             var registrations = baseOptions.Value.Registrations;
@@ -91,27 +93,7 @@ namespace AspNetCore.Diagnostics.CachedHealthChecks
 
                             if (cacheable)
                             {
-                                var opts = optionsSnapshot.Get(registration.Name);
-
-                                var expiresIn = opts.CacheDuration ?? cacheOptionsValue.DefaultCacheDuration;
-                                var expiresAt = DateTime.UtcNow.Add(expiresIn);
-
-                                var data = new Dictionary<string, object>(result.Data)
-                                {
-                                    {
-                                        "cached",
-                                        $"This response was resolved in {DateTime.UtcNow:R} and will remain in cache until {expiresAt:R}"
-                                    }
-                                };
-
-                                entry = new HealthReportEntry(
-                                    status: result.Status,
-                                    description: result.Description,
-                                    duration: duration,
-                                    exception: result.Exception,
-                                    data: data);
-
-                                memoryCache.Set(cacheKey, entry, expiresAt);
+                                entry = BuildAndCacheReportEntry(cacheKey, registration, cacheOptionsValue, optionsSnapshot, result, duration);
                             }
                             else
                             {
@@ -127,36 +109,13 @@ namespace AspNetCore.Diagnostics.CachedHealthChecks
                             Log.HealthCheckData(logger, registration, entry);
                         }
                         // Allow cancellation to propagate.
-                        catch (Exception ex)
-                            when (!(ex is OperationCanceledException))
+                        catch (Exception ex) when (ex as OperationCanceledException == null)
                         {
                             var duration = stopwatch.GetElapsedTime();
 
                             if (cacheable && cacheOptionsValue.CacheExceptions)
                             {
-                                var opts = optionsSnapshot.Get(registration.Name);
-
-                                var expiresIn = opts.ExceptionCacheDuration ??
-                                                cacheOptionsValue.CachedExceptionsDuration ??
-                                                cacheOptionsValue.DefaultCacheDuration;
-                                var expiresAt = DateTime.UtcNow.Add(expiresIn);
-
-                                var data = new Dictionary<string, object>()
-                                {
-                                    {
-                                        "cached",
-                                        $"This response was resolved in {DateTime.UtcNow:R} and will remain in cache until {expiresAt:R}"
-                                    }
-                                };
-
-                                entry = new HealthReportEntry(
-                                    status: HealthStatus.Unhealthy,
-                                    description: ex.Message,
-                                    duration: duration,
-                                    exception: ex,
-                                    data: data);
-
-                                memoryCache.Set(cacheKey, entry, expiresAt);
+                                entry = BuildAndCacheExceptionReport(cacheKey, registration, cacheOptionsValue, optionsSnapshot, ex, duration);
                             }
                             else
                             {
@@ -180,6 +139,210 @@ namespace AspNetCore.Diagnostics.CachedHealthChecks
                 Log.HealthCheckProcessingEnd(logger, healthReport.Status, totalElapsedTime);
                 return healthReport;
             }
+        }
+
+#elif NETCOREAPP3_1
+
+        public override async Task<HealthReport> CheckHealthAsync(Func<HealthCheckRegistration, bool> predicate, CancellationToken cancellationToken = default)
+        {
+            var registrations = baseOptions.Value.Registrations;
+            var cacheOptionsValue = cacheOptions.Value;
+
+            if (predicate != null)
+            {
+                registrations = registrations.Where(predicate).ToArray();
+            }
+
+            var totalTime = ValueStopwatch.StartNew();
+            Log.HealthCheckProcessingBegin(logger);
+
+            var tasks = new Task<HealthReportEntry>[registrations.Count];
+            var index = 0;
+            using (var scope = scopeFactory.CreateScope())
+            {
+                foreach (var registration in registrations)
+                {
+                    tasks[index++] = Task.Run(() => RunCheckAsync(scope, registration, cacheOptionsValue, cancellationToken), cancellationToken);
+                }
+
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+
+            index = 0;
+            var entries = new Dictionary<string, HealthReportEntry>(StringComparer.OrdinalIgnoreCase);
+            foreach (var registration in registrations)
+            {
+                entries[registration.Name] = tasks[index++].Result;
+            }
+
+            var totalElapsedTime = totalTime.GetElapsedTime();
+            var report = new HealthReport(entries, totalElapsedTime);
+            Log.HealthCheckProcessingEnd(logger, report.Status, totalElapsedTime);
+            return report;
+        }
+
+        private async Task<HealthReportEntry> RunCheckAsync(IServiceScope scope, HealthCheckRegistration registration, CacheableHealthChecksServiceOptions cacheOptionsValue, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // If the health check does things like make Database queries using EF or backend HTTP calls,
+            // it may be valuable to know that logs it generates are part of a health check. So we start a scope.
+            using (logger.BeginScope(new HealthCheckLogScope(registration.Name)))
+            {
+                var cacheKey = $"{cacheOptionsValue.CachePrefix}{registration.Name}";
+
+                if (memoryCache.TryGetValue(cacheKey, out HealthReportEntry entry))
+                {
+                    Log.HealthCheckFromCache(logger, registration, entry);
+                    Log.HealthCheckData(logger, registration, entry);
+                }
+                else
+                {
+                    var cacheable = registration.Tags.Any(a => a == cacheOptionsValue.Tag);
+                    var optionsSnapshot = scope.ServiceProvider.GetService<IOptionsSnapshot<RegistrationOptions>>();
+
+                    var healthCheck = registration.Factory(scope.ServiceProvider);
+
+                    var stopwatch = ValueStopwatch.StartNew();
+                    var context = new HealthCheckContext { Registration = registration };
+
+                    Log.HealthCheckBegin(logger, registration);
+
+                    CancellationTokenSource timeoutCancellationTokenSource = null;
+                    try
+                    {
+                        HealthCheckResult result;
+
+                        var checkCancellationToken = cancellationToken;
+                        if (registration.Timeout > TimeSpan.Zero)
+                        {
+                            timeoutCancellationTokenSource =
+                                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                            timeoutCancellationTokenSource.CancelAfter(registration.Timeout);
+                            checkCancellationToken = timeoutCancellationTokenSource.Token;
+                        }
+
+                        result = await healthCheck.CheckHealthAsync(context, checkCancellationToken)
+                            .ConfigureAwait(false);
+
+                        var duration = stopwatch.GetElapsedTime();
+
+                        if (cacheable)
+                        {
+                            entry = BuildAndCacheReportEntry(cacheKey, registration, cacheOptionsValue, optionsSnapshot, result, duration);
+                        }
+                        else
+                        {
+                            entry = new HealthReportEntry(
+                                status: result.Status,
+                                description: result.Description,
+                                duration: duration,
+                                exception: result.Exception,
+                                data: result.Data,
+                                tags: registration.Tags);
+                        }
+
+                        Log.HealthCheckEnd(logger, registration, entry, duration);
+                        Log.HealthCheckData(logger, registration, entry);
+                    }
+                    catch (OperationCanceledException ex) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        var duration = stopwatch.GetElapsedTime();
+                        if (cacheable && cacheOptionsValue.CacheExceptions)
+                        {
+                            entry = BuildAndCacheExceptionReport(cacheKey, registration, cacheOptionsValue, optionsSnapshot, ex, duration);
+                        }
+                        else
+                        {
+                            entry = new HealthReportEntry(
+                                status: HealthStatus.Unhealthy,
+                                description: "A timeout occured while running check.",
+                                duration: duration,
+                                exception: ex,
+                                data: null);
+                        }
+
+                        Log.HealthCheckError(logger, registration, ex, duration);
+                    }
+
+                    // Allow cancellation to propagate if it's not a timeout.
+                    catch (Exception ex) when (ex as OperationCanceledException == null)
+                    {
+                        var duration = stopwatch.GetElapsedTime();
+                        if (cacheable && cacheOptionsValue.CacheExceptions)
+                        {
+                            entry = BuildAndCacheExceptionReport(cacheKey, registration, cacheOptionsValue, optionsSnapshot, ex, duration);
+                        }
+                        else
+                        {
+                            entry = new HealthReportEntry(
+                                status: HealthStatus.Unhealthy,
+                                description: ex.Message,
+                                duration: duration,
+                                exception: ex,
+                                data: null);
+                        }
+
+                        Log.HealthCheckError(logger, registration, ex, duration);
+                    }
+                    finally
+                    {
+                        timeoutCancellationTokenSource?.Dispose();
+                    }
+                }
+
+                return entry;
+            }
+        }
+
+#endif
+
+        private HealthReportEntry BuildAndCacheExceptionReport(string cacheKey, HealthCheckRegistration registration,
+            CacheableHealthChecksServiceOptions cacheOptionsValue,
+            IOptionsSnapshot<RegistrationOptions> optionsSnapshot, Exception exception, TimeSpan duration)
+        {
+            var opts = optionsSnapshot.Get(registration.Name);
+            var expiresIn = opts.ExceptionCacheDuration ??
+                            cacheOptionsValue.CachedExceptionsDuration ?? cacheOptionsValue.DefaultCacheDuration;
+
+            return BuildAndCacheReportEntry(cacheKey, expiresIn, HealthStatus.Unhealthy, exception.Message, duration,
+                exception, new Dictionary<string, object>());
+        }
+
+        private HealthReportEntry BuildAndCacheReportEntry(string cacheKey, HealthCheckRegistration registration,
+            CacheableHealthChecksServiceOptions cacheOptionsValue,
+            IOptionsSnapshot<RegistrationOptions> optionsSnapshot, HealthCheckResult result, TimeSpan duration)
+        {
+            var opts = optionsSnapshot.Get(registration.Name);
+            var expiresIn = opts.CacheDuration ?? cacheOptionsValue.DefaultCacheDuration;
+
+            return BuildAndCacheReportEntry(cacheKey, expiresIn, result.Status, result.Description, duration,
+                result.Exception, result.Data);
+        }
+
+        private HealthReportEntry BuildAndCacheReportEntry(string cacheKey, TimeSpan expiresIn, HealthStatus healthStatus,
+            string description, TimeSpan duration, Exception exception, IReadOnlyDictionary<string, object> healthData)
+        {
+            var expiresAt = DateTime.UtcNow.Add(expiresIn);
+
+            var data = new Dictionary<string, object>(healthData)
+            {
+                {
+                    "cached",
+                    $"This response was resolved in {DateTime.UtcNow:R} and will remain in cache until {expiresAt:R}"
+                }
+            };
+
+            var entry = new HealthReportEntry(
+                status: healthStatus,
+                description: description,
+                duration: duration,
+                exception: exception,
+                data: data);
+
+            memoryCache.Set(cacheKey, entry, expiresAt);
+
+            return entry;
         }
 
         private static void ValidateRegistrations(HealthCheckRegistration[] registrations)
