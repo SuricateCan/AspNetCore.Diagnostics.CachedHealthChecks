@@ -340,7 +340,13 @@ namespace AspNetCore.Diagnostics.CachedHealthChecks
                 exception: exception,
                 data: data);
 
-            memoryCache.Set(cacheKey, entry, expiresAt);
+            var memoryCacheEntryOptions = new MemoryCacheEntryOptions
+            {
+                AbsoluteExpirationRelativeToNow = expiresIn,
+                Size = System.Runtime.InteropServices.Marshal.SizeOf(entry)
+            };
+
+            memoryCache.Set(cacheKey, entry, memoryCacheEntryOptions);
 
             return entry;
         }
